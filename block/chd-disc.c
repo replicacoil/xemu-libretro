@@ -47,11 +47,21 @@ typedef struct ChdTrack {
     uint32_t data_offset;   /* of the 2048 bytes in a frame */
 } ChdTrack;
 
+/* The decoded hunks kept: 16 MiB, whatever the hunk size */
+#define CHD_CACHE_BYTES (16u * 1024 * 1024)
+
 struct ChdDisc {
     chd_file *chd;
-    uint8_t *hunk_buf;
+    /*
+     * The decoded hunks kept, direct-mapped: hunk h lives in slot h % nslots,
+     * and cache_hunk[slot] says which hunk that is (-1 for none). A disc is
+     * read mostly in order, which this keeps whole, and two streams only
+     * disturb each other where their hunks meet in a slot.
+     */
+    uint8_t *cache;
+    int64_t *cache_hunk;
+    uint32_t nslots;        /* a power of two */
     uint32_t hunkbytes;
-    int64_t cur_hunk;       /* the one in hunk_buf, -1 for none */
     bool dvd;               /* flat 2048-byte units, else a CD's frames */
     uint32_t frames_per_hunk;
     ChdTrack *tracks;
@@ -211,7 +221,6 @@ ChdDisc *chd_disc_new(chd_file *chd, char *err, size_t errlen)
     }
     d->chd = chd;
     d->hunkbytes = hdr->hunkbytes;
-    d->cur_hunk = -1;
 
     if (!read_cd_tracks(d, err, errlen)) {
         goto fail;
@@ -254,14 +263,25 @@ ChdDisc *chd_disc_new(chd_file *chd, char *err, size_t errlen)
         set_err(err, errlen, "empty CHD image");
         goto fail;
     }
-    d->hunk_buf = malloc(d->hunkbytes);
-    if (!d->hunk_buf) {
+    d->nslots = 4;
+    while (d->nslots < 8192 &&
+           (uint64_t)d->nslots * 2 * d->hunkbytes <= CHD_CACHE_BYTES) {
+        d->nslots *= 2;
+    }
+    d->cache = malloc((size_t)d->nslots * d->hunkbytes);
+    d->cache_hunk = malloc(d->nslots * sizeof(*d->cache_hunk));
+    if (!d->cache || !d->cache_hunk) {
         set_err(err, errlen, "out of memory");
         goto fail;
+    }
+    for (uint32_t i = 0; i < d->nslots; i++) {
+        d->cache_hunk[i] = -1;
     }
     return d;
 
 fail:
+    free(d->cache);
+    free(d->cache_hunk);
     free(d->tracks);
     free(d);
     return NULL;
@@ -272,7 +292,8 @@ void chd_disc_free(ChdDisc *d)
     if (!d) {
         return;
     }
-    free(d->hunk_buf);
+    free(d->cache);
+    free(d->cache_hunk);
     free(d->tracks);
     free(d);
 }
@@ -282,38 +303,20 @@ uint64_t chd_disc_sectors(const ChdDisc *d)
     return d->sectors;
 }
 
-static bool load_hunk(ChdDisc *d, uint64_t hunk, char *err, size_t errlen)
-{
-    chd_error cerr;
-
-    if ((int64_t)hunk == d->cur_hunk) {
-        return true;
-    }
-    d->cur_hunk = -1;
-    cerr = chd_read(d->chd, (uint32_t)hunk, d->hunk_buf);
-    if (cerr != CHDERR_NONE) {
-        set_err(err, errlen, "CHD read failed: %s", chd_error_string(cerr));
-        return false;
-    }
-    d->cur_hunk = (int64_t)hunk;
-    return true;
-}
-
-const uint8_t *chd_disc_sector(ChdDisc *d, uint64_t lba, char *err,
-                               size_t errlen)
+/* Where sector lba is: the hunk, and the offset of its 2048 bytes in it */
+static bool locate_sector(ChdDisc *d, uint64_t lba, uint64_t *hunk,
+                          size_t *offset, char *err, size_t errlen)
 {
     if (lba >= d->sectors) {
         set_err(err, errlen, "LBA %" PRIu64 " out of range", lba);
-        return NULL;
+        return false;
     }
 
     if (d->dvd) {
         uint64_t byte = lba * CHD_DISC_SECTOR_SIZE;
 
-        if (!load_hunk(d, byte / d->hunkbytes, err, errlen)) {
-            return NULL;
-        }
-        return d->hunk_buf + byte % d->hunkbytes;
+        *hunk = byte / d->hunkbytes;
+        *offset = byte % d->hunkbytes;
     } else {
         const ChdTrack *tr = NULL;
         uint64_t frame;
@@ -328,15 +331,56 @@ const uint8_t *chd_disc_sector(ChdDisc *d, uint64_t lba, char *err,
         }
         if (!tr) {
             set_err(err, errlen, "LBA %" PRIu64 " is in no track", lba);
-            return NULL;
+            return false;
         }
         frame = tr->chd_frame + (lba - tr->first_lba);
-        if (!load_hunk(d, frame / d->frames_per_hunk, err, errlen)) {
+        *hunk = frame / d->frames_per_hunk;
+        *offset = (frame % d->frames_per_hunk) * CD_FRAME_SIZE +
+                  tr->data_offset;
+    }
+    return true;
+}
+
+static uint8_t *hunk_slot(ChdDisc *d, uint64_t hunk)
+{
+    return d->cache + (size_t)(hunk & (d->nslots - 1)) * d->hunkbytes;
+}
+
+const uint8_t *chd_disc_sector_cached(ChdDisc *d, uint64_t lba)
+{
+    uint64_t hunk;
+    size_t offset;
+
+    if (!locate_sector(d, lba, &hunk, &offset, NULL, 0) ||
+        d->cache_hunk[hunk & (d->nslots - 1)] != (int64_t)hunk) {
+        return NULL;
+    }
+    return hunk_slot(d, hunk) + offset;
+}
+
+const uint8_t *chd_disc_sector(ChdDisc *d, uint64_t lba, char *err,
+                               size_t errlen)
+{
+    uint64_t hunk;
+    size_t offset;
+    uint32_t slot;
+
+    if (!locate_sector(d, lba, &hunk, &offset, err, errlen)) {
+        return NULL;
+    }
+    slot = hunk & (d->nslots - 1);
+    if (d->cache_hunk[slot] != (int64_t)hunk) {
+        chd_error cerr;
+
+        d->cache_hunk[slot] = -1;
+        cerr = chd_read(d->chd, (uint32_t)hunk, hunk_slot(d, hunk));
+        if (cerr != CHDERR_NONE) {
+            set_err(err, errlen, "CHD read failed: %s", chd_error_string(cerr));
             return NULL;
         }
-        return d->hunk_buf +
-               (frame % d->frames_per_hunk) * CD_FRAME_SIZE + tr->data_offset;
+        d->cache_hunk[slot] = (int64_t)hunk;
     }
+    return hunk_slot(d, hunk) + offset;
 }
 
 bool chd_disc_path_is_chd(const char *path)

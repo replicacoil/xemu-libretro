@@ -60,12 +60,22 @@ void chd_disc_free(ChdDisc *disc);
 uint64_t chd_disc_sectors(const ChdDisc *disc);
 
 /*
- * The 2048 bytes of sector lba, valid until the next call on this disc (the
- * hunk they are in is kept); NULL on an error, with the reason in err. Not
- * thread-safe: one reader at a time.
+ * The 2048 bytes of sector lba, decoded if its hunk is not among the 16 MiB
+ * of them that are kept; NULL on an error, with the reason in err. The bytes
+ * stay valid until a later call needs their place in the cache, so copy them
+ * out before the next one. This is where libchdr reads and decodes, and so
+ * where the time goes: it may run on any thread, as long as no two calls on a
+ * disc (or on its CHD) overlap.
  */
 const uint8_t *chd_disc_sector(ChdDisc *disc, uint64_t lba,
                                char *err, size_t errlen);
+
+/*
+ * The same for a sector whose hunk is already in the cache: NULL if it is not,
+ * with no reading and nothing decoded, so a caller can tell whether
+ * chd_disc_sector would take time.
+ */
+const uint8_t *chd_disc_sector_cached(ChdDisc *disc, uint64_t lba);
 
 /* Whether path names a CHD: ends in ".chd", in any case */
 bool chd_disc_path_is_chd(const char *path);
