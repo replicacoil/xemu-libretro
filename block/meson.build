@@ -42,6 +42,12 @@ block_ss.add(files(
   'write-threshold.c',
 ), zstd, zlib)
 
+# CHD disc images, read through libchdr
+block_ss.add(files(
+  'chd.c',
+  'chd-disc.c',
+), libchdr)
+
 system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
 system_ss.add(files('block-ram-registrar.c'))
 system_ss.add(files('blkmemory.c'))

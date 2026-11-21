@@ -4142,6 +4142,36 @@ if have_block
     block_ss.add(files('replication.c'))
   endif
 
+  # CHD disc images (block/chd.c, block/chd-disc.c): libchdr as a static CMake
+  # subproject, with the miniz, lzma and zstd it carries, so that no host needs
+  # them installed (the Android build has no system zstd).
+  libchdr_opts = cmake.subproject_options()
+  libchdr_opts.add_cmake_defines({
+    'BUILD_SHARED_LIBS': 'OFF',
+    'WITH_SYSTEM_ZLIB': 'OFF',
+    'WITH_SYSTEM_ZSTD': 'OFF',
+    'INSTALL_STATIC_LIBS': 'OFF',
+  })
+  if host_os == 'darwin'
+    libchdr_opts.add_cmake_defines({'CMAKE_OSX_ARCHITECTURES': cmake_macos_arch})
+  endif
+  # the core is a shared library: the static library that goes into it needs PIC
+  if get_option('libretro') and host_os != 'windows'
+    libchdr_opts.add_cmake_defines({'CMAKE_POSITION_INDEPENDENT_CODE': 'ON'})
+    libchdr_opts.set_override_option('b_staticpic', 'true')
+  endif
+  libchdr_sp = cmake.subproject('libchdr', options: libchdr_opts, required: true)
+  # libchdr's CMake keeps its codecs in libraries of their own, which the
+  # static library does not carry
+  libchdr = declare_dependency(
+    link_with: [
+      libchdr_sp.target('chdr-static'),
+      libchdr_sp.target('chdr-lzma'),
+      libchdr_sp.target('miniz'),
+      libchdr_sp.target('zstd'),
+    ],
+    include_directories: libchdr_sp.include_directories('chdr-static'))
+
   subdir('nbd')
   subdir('scsi')
   subdir('block')

@@ -29,6 +29,7 @@
 #include "system/blockdev.h"
 #include "system/block-backend.h"
 #include "block/block.h"
+#include "block/chd-disc.h"
 #include "block/snapshot.h"
 #include "block/graph-lock.h"
 #include "qobject/qdict.h"
@@ -2155,9 +2156,13 @@ static void *emu_thread_func(void *opaque)
         libretro_input_create_xid_devices();
         apply_eeprom_settings();
         machine_built = true;
-        /* default.xbe patched: the drive gets the overlay before the
-         * dashboard reads the disc (the vCPUs need the BQL this holds) */
-        if (!xemu_chihiro_mode() && xemu_libretro_has_xbe_patches(opt_dvd_path)) {
+        /* default.xbe patched, or a CHD: the drive gets the overlay, or the
+         * disc out of the CHD with its game partition's offset, before the
+         * dashboard reads the disc (the vCPUs need the BQL this holds). The
+         * machine was built with an empty drive for a CHD (system/vl.c). */
+        if (!xemu_chihiro_mode() &&
+            (xemu_libretro_has_xbe_patches(opt_dvd_path) ||
+             chd_disc_path_is_chd(opt_dvd_path))) {
             extern void xemu_libretro_change_disc(const char *path, Error **errp);
             Error *err = NULL;
             xemu_libretro_change_disc(opt_dvd_path, &err);
@@ -2497,12 +2502,16 @@ static bool xiso_find_xbe(xiso_read_fn rd, void *ctx, uint32_t *sector, uint32_t
 
 struct xiso_file {
     FILE *f;
+    ChdDiscFile *chd; /* a CHD's disc, in place of f */
     int64_t base;
 };
 
 static bool xiso_file_read(void *ctx, int64_t off, size_t len, void *buf)
 {
     struct xiso_file *x = ctx;
+    if (x->chd) {
+        return chd_disc_file_read(x->chd, (uint64_t)(x->base + off), buf, len);
+    }
     return fseeko(x->f, (off_t)(x->base + off), SEEK_SET) == 0 &&
            fread(buf, 1, len, x->f) == len;
 }
@@ -2521,13 +2530,15 @@ static bool xiso_title(const char *image, uint32_t *title_id, char **title_name,
                        uint32_t *regions, uint32_t *version)
 {
     static const int64_t offsets[] = { 0, 0x18300000, 0xFD90000, 0x2080000 };
-    FILE *f = fopen(image, "rb");
-    if (!f) {
+    ChdDiscFile *chd = chd_disc_path_is_chd(image) ? chd_disc_file_open(image)
+                                                   : NULL;
+    FILE *f = chd_disc_path_is_chd(image) ? NULL : fopen(image, "rb");
+    if (!f && !chd) {
         return false;
     }
     bool ok = false;
     for (size_t i = 0; i < ARRAY_SIZE(offsets) && !ok; i++) {
-        struct xiso_file x = { f, offsets[i] };
+        struct xiso_file x = { f, chd, offsets[i] };
         uint32_t sector, size;
         uint8_t hdr[0x120], cert[0xB0];
         if (!xiso_find_xbe(xiso_file_read, &x, &sector, &size) ||
@@ -2551,7 +2562,11 @@ static bool xiso_title(const char *image, uint32_t *title_id, char **title_name,
         *title_name = g_utf16_to_utf8(name, -1, NULL, NULL, NULL);
         ok = *title_name != NULL;
     }
-    fclose(f);
+    if (chd) {
+        chd_disc_file_close(chd);
+    } else {
+        fclose(f);
+    }
     return ok;
 }
 
@@ -3216,8 +3231,15 @@ char *xemu_libretro_xbe_patched(const char *image, uint64_t offset)
     QDict *opts = qdict_new();
     qdict_put_str(opts, "driver", "raw");
     qdict_put_int(opts, "offset", (int64_t)offset);
-    qdict_put_str(opts, "file.driver", "file");
-    qdict_put_str(opts, "file.filename", image);
+    if (chd_disc_path_is_chd(image)) {
+        /* the disc out of the CHD, as the drive reads it (system/vl.c) */
+        qdict_put_str(opts, "file.driver", "chd");
+        qdict_put_str(opts, "file.file.driver", "file");
+        qdict_put_str(opts, "file.file.filename", image);
+    } else {
+        qdict_put_str(opts, "file.driver", "file");
+        qdict_put_str(opts, "file.filename", image);
+    }
     BlockBackend *iso = blk_new_open(NULL, NULL, opts, 0, &err);
     if (!iso) {
         LRLOG_ERROR("[xemu] XBE patches: cannot open %s: %s\n", image, error_get_pretty(err));
@@ -3607,7 +3629,7 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
     memset(info, 0, sizeof(*info));
     info->library_name     = "xemu";
     info->library_version  = xemu_libretro_version;
-    info->valid_extensions = "iso|xiso|bin";
+    info->valid_extensions = "iso|xiso|bin|chd";
     info->need_fullpath    = true;
     info->block_extract    = true;
 }
@@ -3830,6 +3852,26 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
     }
 
     const char *content = (game && game->path) ? game->path : "";
+
+    /* A CHD (CD or DVD image of chdman) is an Xbox disc or nothing: Chihiro
+     * games are .bin netboot images, and the check below, which takes any
+     * image that is not an Xbox disc for one, would boot a CHD that does not
+     * read, or holds another system's disc, as a Chihiro game. libchdr reads
+     * a plain path; the VFS paths of Android (saf://) are not read yet. */
+    if (content[0] && chd_disc_path_is_chd(content)) {
+        ChdDiscFile *probe = chd_disc_file_open(content);
+        if (!probe) {
+            load_refused(strstr(content, "://")
+                ? "xemu: a CHD has to be on a plain path, not a saf:// or other URI"
+                : "xemu: cannot read this CHD (it has to be a CD or DVD image made by chdman, createdvd or createcd, with one data track)");
+            return false;
+        }
+        chd_disc_file_close(probe);
+        if (!xemu_media_is_xbox_disc(content)) {
+            load_refused("xemu: this CHD does not hold an Xbox disc image");
+            return false;
+        }
+    }
 
     /* The machine that is there is an Xbox or a Chihiro, and the next
      * content only gets its disc swapped: a Chihiro game after an Xbox one

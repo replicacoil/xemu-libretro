@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 
+#include "block/chd-disc.h"
 #include "xemu-config.h"
 #include "xemu-settings.h"
 
@@ -100,6 +101,21 @@ bool xemu_media_is_xbox_disc(const char *path)
     static const long partitions[] = { 0, 0x18300000 };
     if (!path || !path[0] || g_file_test(path, G_FILE_TEST_IS_DIR)) {
         return false;
+    }
+    /* A CHD holds the image compressed: its sectors are read through libchdr
+     * (block/chd-disc.c), the same places in them. This runs before the block
+     * layer is up. */
+    if (chd_disc_path_is_chd(path)) {
+        ChdDiscFile *chd = chd_disc_file_open(path);
+        bool disc = false;
+        for (int i = 0; chd && i < 2 && !disc; i++) {
+            char buf[sizeof(magic) - 1];
+            disc = chd_disc_file_read(chd, partitions[i] + 0x10000, buf,
+                                      sizeof(buf)) &&
+                   memcmp(buf, magic, sizeof(buf)) == 0;
+        }
+        chd_disc_file_close(chd);
+        return disc;
     }
     FILE *f = fopen(path, "rb");
     if (!f) {

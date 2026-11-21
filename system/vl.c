@@ -155,6 +155,7 @@
 #include "hw/xbox/eeprom_generation.h"
 #include "hw/xbox/chihiro/chihiro.h"
 #include "block/block-global-state.h"
+#include "block/chd-disc.h"
 
 #define MAX_VIRTIO_CONSOLES 1
 
@@ -2670,6 +2671,22 @@ static uint64_t xbox_game_partition_offset(const char *path)
     if (!path || !path[0]) {
         return 0;
     }
+    if (chd_disc_path_is_chd(path)) {
+        /* the offsets are the disc's, in a file that holds it compressed:
+         * read through libchdr (this also runs before the block layer is up) */
+        ChdDiscFile *chd = chd_disc_file_open(path);
+        for (size_t i = 0; chd && i < ARRAY_SIZE(offsets); i++) {
+            char buf[sizeof(magic) - 1];
+            if (chd_disc_file_read(chd, offsets[i] + 32 * 2048, buf,
+                                   sizeof(buf)) &&
+                memcmp(buf, magic, sizeof(buf)) == 0) {
+                found = offsets[i];
+                break;
+            }
+        }
+        chd_disc_file_close(chd);
+        return found;
+    }
     if (strstr(path, "://")) {
         if (!xemu_libretro_vfs) {
             return 0;
@@ -2729,6 +2746,10 @@ void xemu_libretro_change_disc(const char *path, Error **errp)
     err = NULL;
 
     const uint64_t offset = xbox_game_partition_offset(path);
+    /* A CHD (block/chd.c) is the image compressed: the drive reads the disc
+     * out of it, with the game partition's offset and the patch overlay on
+     * the disc, not on the file */
+    const bool chd = chd_disc_path_is_chd(path);
     /* default.xbe patched: a qcow2 overlay over the image (ui/libretro.c) */
     extern char *xemu_libretro_xbe_patched(const char *image, uint64_t offset);
     g_autofree char *overlay = xemu_libretro_xbe_patched(path, offset);
@@ -2739,8 +2760,14 @@ void xemu_libretro_change_disc(const char *path, Error **errp)
         qdict_put_str(options, "file.filename", overlay);
         qdict_put_str(options, "backing.driver", "raw");
         qdict_put_int(options, "backing.offset", (int64_t)offset);
-        qdict_put_str(options, "backing.file.driver", "file");
-        qdict_put_str(options, "backing.file.filename", path);
+        if (chd) {
+            qdict_put_str(options, "backing.file.driver", "chd");
+            qdict_put_str(options, "backing.file.file.driver", "file");
+            qdict_put_str(options, "backing.file.file.filename", path);
+        } else {
+            qdict_put_str(options, "backing.file.driver", "file");
+            qdict_put_str(options, "backing.file.filename", path);
+        }
         QObject *crumpled = qdict_crumple(options, &err);
         qobject_unref(options);
         if (crumpled) {
@@ -2757,7 +2784,12 @@ void xemu_libretro_change_disc(const char *path, Error **errp)
         QDict *options = qdict_new();
         qdict_put_str(options, "driver", "raw");
         qdict_put_int(options, "offset", (int64_t)offset);
-        qdict_put_str(options, "file.filename", path);
+        if (chd) {
+            qdict_put_str(options, "file.driver", "chd");
+            qdict_put_str(options, "file.file.filename", path);
+        } else {
+            qdict_put_str(options, "file.filename", path);
+        }
         GString *json = qobject_to_json(QOBJECT(options));
         char *filename = g_strdup_printf("json:%s", json->str);
         fprintf(stderr, "xemu: DVD: Redump image, the game partition from "
@@ -2768,8 +2800,8 @@ void xemu_libretro_change_disc(const char *path, Error **errp)
         g_string_free(json, true);
         qobject_unref(options);
     } else {
-        qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", true, true,
-                                   false, 0, &err);
+        qmp_blockdev_change_medium("ide0-cd1", NULL, path, chd ? "chd" : "raw",
+                                   true, true, false, 0, &err);
     }
     if (err) {
         error_propagate(errp, err);
@@ -3418,6 +3450,14 @@ void qemu_init(int argc, char **argv)
     }
 
     const char *dvd_path = g_config.sys.files.dvd_path;
+#ifdef LIBRETRO
+    /* A CHD goes into the drive once the machine is built, through
+     * xemu_libretro_change_disc (ui/libretro.c), which reads the disc out of
+     * it with its game partition's offset: the drive starts empty */
+    if (chd_disc_path_is_chd(dvd_path)) {
+        dvd_path = "";
+    }
+#endif
 
     /* An Xbox mounts the image in its DVD drive. A Chihiro has none: its IDE
      * slave is the media board's interface (chihiro_ide_interface_init),
